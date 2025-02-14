@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 from datetime import datetime, timedelta
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -10,13 +11,33 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
 from pytz import timezone
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Load environment variables
 load_dotenv()
+logger.info("Environment variables loaded")
+
+# Verify environment variables
+slack_token = os.getenv('SLACK_TOKEN')
+google_creds = os.getenv('GOOGLE_CREDENTIALS')
+my_calendar = os.getenv('MY_CALENDAR_ID')
+team_calendars = os.getenv('TEAM_CALENDAR_IDS')
+
+logger.info(f"SLACK_TOKEN present: {bool(slack_token)}")
+logger.info(f"GOOGLE_CREDENTIALS present: {bool(google_creds)}")
+logger.info(f"MY_CALENDAR_ID present: {bool(my_calendar)}")
+logger.info(f"TEAM_CALENDAR_IDS present: {bool(team_calendars)}")
 
 # Slack configuration
-SLACK_TOKEN = os.getenv('SLACK_TOKEN')
 CHANNEL_ID = 'C08B0CAFD3J'
-slack_client = WebClient(token=SLACK_TOKEN)
+try:
+    slack_client = WebClient(token=slack_token)
+    logger.info("Slack client initialized")
+except Exception as e:
+    logger.error(f"Error initializing Slack client: {str(e)}")
+    raise
 
 # Google Calendar configuration
 SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
@@ -33,22 +54,30 @@ LEAVE_KEYWORDS = [
 ]
 
 def get_google_calendar_service():
+    logger.info("Attempting to get Google Calendar service")
     creds_json = os.getenv('GOOGLE_CREDENTIALS')
     if creds_json:
-        creds_dict = json.loads(creds_json)
-        creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
-        return build('calendar', 'v3', credentials=creds)
+        try:
+            creds_dict = json.loads(creds_json)
+            creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
+            service = build('calendar', 'v3', credentials=creds)
+            logger.info("Google Calendar service created successfully")
+            return service
+        except Exception as e:
+            logger.error(f"Error creating Google Calendar service: {str(e)}")
+            raise
     raise Exception("Google credentials not found in environment variables")
 
 def post_to_slack(message):
+    logger.info(f"Attempting to post message to Slack: {message[:50]}...")
     try:
         response = slack_client.chat_postMessage(
             channel=CHANNEL_ID,
             text=message
         )
-        print(f"Message sent to Slack: {message[:50]}...")
+        logger.info("Message posted to Slack successfully")
     except SlackApiError as e:
-        print(f"Error posting to Slack: {e.response['error']}")
+        logger.error(f"Error posting to Slack: {e.response['error']}")
         raise
 
 def is_leave_event(event_summary):
@@ -57,6 +86,7 @@ def is_leave_event(event_summary):
     return any(keyword in event_summary.lower() for keyword in LEAVE_KEYWORDS)
 
 def check_team_leave():
+    logger.info("Checking team leave")
     service = get_google_calendar_service()
     team_calendars = os.getenv('TEAM_CALENDAR_IDS').split(',')
     
@@ -67,6 +97,7 @@ def check_team_leave():
     on_leave = []
     
     for calendar_id in team_calendars:
+        logger.info(f"Checking calendar: {calendar_id}")
         events = service.events().list(
             calendarId=calendar_id,
             timeMin=today_start,
@@ -88,6 +119,7 @@ def check_team_leave():
     post_to_slack(message)
 
 def check_daily_meetings():
+    logger.info("Checking daily meetings")
     service = get_google_calendar_service()
     calendar_id = os.getenv('MY_CALENDAR_ID')
     
@@ -118,7 +150,6 @@ def check_daily_meetings():
                 orderBy='startTime'
             ).execute()
             events['items'].extend(personal_events.get('items', []))
-            # Sort combined events by start time
             events['items'].sort(key=lambda x: x['start'].get('dateTime', x['start'].get('date')))
         
         meetings = []
@@ -134,41 +165,6 @@ def check_daily_meetings():
     
     return get_meetings_message(today), get_meetings_message(tomorrow, False)
 
-def check_upcoming_leave():
-    service = get_google_calendar_service()
-    team_calendars = os.getenv('TEAM_CALENDAR_IDS').split(',')
-    
-    today = datetime.now(timezone('UTC')).date()
-    start = datetime.combine(today, datetime.min.time()).isoformat() + 'Z'
-    end = datetime.combine(today + timedelta(days=10), datetime.max.time()).isoformat() + 'Z'
-    
-    upcoming_leave = []
-    
-    for calendar_id in team_calendars:
-        events = service.events().list(
-            calendarId=calendar_id,
-            timeMin=start,
-            timeMax=end,
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
-        
-        for event in events.get('items', []):
-            if is_leave_event(event.get('summary', '')):
-                start_date = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date'))).date()
-                name = event['summary'].split(' - ')[0] if ' - ' in event['summary'] else calendar_id.split('@')[0]
-                upcoming_leave.append((start_date, name))
-    
-    if upcoming_leave:
-        upcoming_leave.sort()
-        message = "📅 *Upcoming Team Leave (Next 10 Days)*\n"
-        for date, name in upcoming_leave:
-            message += f"• {date.strftime('%d %B')}: {name}\n"
-    else:
-        message = "📅 *Upcoming Team Leave*\nNo upcoming team leave in the next 10 days."
-    
-    post_to_slack(message)
-
 def morning_meetings():
     today_meetings, _ = check_daily_meetings()
     post_to_slack(today_meetings)
@@ -178,30 +174,30 @@ def evening_meetings():
     post_to_slack(tomorrow_meetings)
 
 if __name__ == "__main__":
-    print("Starting test sequence...")
-    # Send test messages
+    logger.info("Starting application")
     try:
         # Test Slack connection
-        print("Testing Slack connection...")
+        logger.info("Testing Slack connection")
         post_to_slack("🧪 Test message: Bot is now connected!")
         
         # Test Google Calendar connection
-        print("Testing Google Calendar connection...")
+        logger.info("Testing Google Calendar connection")
         service = get_google_calendar_service()
         today_meetings, tomorrow_meetings = check_daily_meetings()
         post_to_slack("📅 Test calendar fetch successful!\n" + today_meetings)
         
         # Test team leave check
-        print("Testing team leave check...")
+        logger.info("Testing team leave check")
         check_team_leave()
         
-        print("Test messages sent successfully!")
+        logger.info("All tests completed successfully")
     except Exception as e:
-        print(f"Error during test: {str(e)}")
+        logger.error(f"Error during test: {str(e)}")
         try:
             post_to_slack(f"⚠️ Test Error: {str(e)}")
         except:
-            print("Could not send error message to Slack")
+            logger.error("Could not send error message to Slack")
+            raise
     
     # Set up regular schedule
     scheduler = BlockingScheduler()
@@ -210,5 +206,5 @@ if __name__ == "__main__":
     scheduler.add_job(morning_meetings, 'cron', hour=8, minute=50)
     scheduler.add_job(evening_meetings, 'cron', hour=16, minute=55)
     
-    print("Starting scheduler...")
+    logger.info("Starting scheduler")
     scheduler.start()
