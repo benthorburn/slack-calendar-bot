@@ -32,11 +32,15 @@ logger.info(f"TEAM_CALENDAR_IDS present: {bool(team_calendars)}")
 
 # Slack configuration
 CHANNEL_ID = 'C08B0CAFD3J'
+slack_client = WebClient(token=slack_token)
+logger.info("Slack client initialized")
+
+# Verify channel access
 try:
-    slack_client = WebClient(token=slack_token)
-    logger.info("Slack client initialized")
-except Exception as e:
-    logger.error(f"Error initializing Slack client: {str(e)}")
+    channel_info = slack_client.conversations_info(channel=CHANNEL_ID)
+    logger.info(f"Successfully verified access to channel: {channel_info['channel']['name']}")
+except SlackApiError as e:
+    logger.error(f"Error accessing channel: {str(e)}")
     raise
 
 # Google Calendar configuration
@@ -50,7 +54,13 @@ LEAVE_KEYWORDS = [
     'out of office',
     'ooo',
     'pto',
-    'time off'
+    'time off',
+    'toil',
+    'rdo',
+    'al',
+    ' al ',  # Space before and after to avoid matching words like "personal"
+    'al-',
+    'al:'
 ]
 
 def get_google_calendar_service():
@@ -83,7 +93,8 @@ def post_to_slack(message):
 def is_leave_event(event_summary):
     if not event_summary:
         return False
-    return any(keyword in event_summary.lower() for keyword in LEAVE_KEYWORDS)
+    event_summary_lower = event_summary.lower()
+    return any(keyword in event_summary_lower for keyword in LEAVE_KEYWORDS)
 
 def check_team_leave():
     logger.info("Checking team leave")
@@ -109,10 +120,13 @@ def check_team_leave():
         for event in events.get('items', []):
             if is_leave_event(event.get('summary', '')):
                 name = event['summary'].split(' - ')[0] if ' - ' in event['summary'] else calendar_id.split('@')[0]
-                on_leave.append(name)
+                leave_type = next((keyword for keyword in LEAVE_KEYWORDS if keyword in event.get('summary', '').lower()), 'Leave')
+                on_leave.append((name, leave_type.upper()))
     
     if on_leave:
-        message = f"🏖️ *Team Leave Update*\nTeam members on leave today: {', '.join(on_leave)}"
+        message = "🏖️ *Team Leave Update*\n"
+        for name, leave_type in on_leave:
+            message += f"• {name} ({leave_type})\n"
     else:
         message = "🏢 *Team Leave Update*\nNo team members on leave today."
     
@@ -164,6 +178,44 @@ def check_daily_meetings():
         return f"📅 *Meetings for {day_str}*\nNo meetings scheduled."
     
     return get_meetings_message(today), get_meetings_message(tomorrow, False)
+
+def check_upcoming_leave():
+    logger.info("Checking upcoming leave")
+    service = get_google_calendar_service()
+    team_calendars = os.getenv('TEAM_CALENDAR_IDS').split(',')
+    
+    today = datetime.now(timezone('UTC')).date()
+    start = datetime.combine(today, datetime.min.time()).isoformat() + 'Z'
+    end = datetime.combine(today + timedelta(days=10), datetime.max.time()).isoformat() + 'Z'
+    
+    upcoming_leave = []
+    
+    for calendar_id in team_calendars:
+        logger.info(f"Checking calendar: {calendar_id}")
+        events = service.events().list(
+            calendarId=calendar_id,
+            timeMin=start,
+            timeMax=end,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        for event in events.get('items', []):
+            if is_leave_event(event.get('summary', '')):
+                start_date = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date'))).date()
+                name = event['summary'].split(' - ')[0] if ' - ' in event['summary'] else calendar_id.split('@')[0]
+                leave_type = next((keyword for keyword in LEAVE_KEYWORDS if keyword in event.get('summary', '').lower()), 'Leave')
+                upcoming_leave.append((start_date, name, leave_type.upper()))
+    
+    if upcoming_leave:
+        upcoming_leave.sort()
+        message = "📅 *Upcoming Team Leave (Next 10 Days)*\n"
+        for date, name, leave_type in upcoming_leave:
+            message += f"• {date.strftime('%d %B')}: {name} ({leave_type})\n"
+    else:
+        message = "📅 *Upcoming Team Leave*\nNo upcoming team leave in the next 10 days."
+    
+    post_to_slack(message)
 
 def morning_meetings():
     today_meetings, _ = check_daily_meetings()
