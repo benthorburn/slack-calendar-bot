@@ -21,6 +21,18 @@ slack_client = WebClient(token=SLACK_TOKEN)
 # Google Calendar configuration
 SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 
+# Keywords that indicate leave
+LEAVE_KEYWORDS = [
+    'annual leave',
+    'vacation',
+    'holiday',
+    'out of office',
+    'AL',
+    'toil',
+    'time off',
+    'RDO'
+]
+
 def get_google_calendar_service():
     creds_json = os.getenv('GOOGLE_CREDENTIALS')
     if creds_json:
@@ -37,6 +49,11 @@ def post_to_slack(message):
         )
     except SlackApiError as e:
         print(f"Error posting to Slack: {e.response['error']}")
+
+def is_leave_event(event_summary):
+    if not event_summary:
+        return False
+    return any(keyword in event_summary.lower() for keyword in LEAVE_KEYWORDS)
 
 def check_team_leave():
     service = get_google_calendar_service()
@@ -58,8 +75,9 @@ def check_team_leave():
         ).execute()
         
         for event in events.get('items', []):
-            if 'Annual Leave' in event.get('summary', ''):
-                on_leave.append(event['summary'].split(' - ')[0])
+            if is_leave_event(event.get('summary', '')):
+                name = event['summary'].split(' - ')[0] if ' - ' in event['summary'] else calendar_id.split('@')[0]
+                on_leave.append(name)
     
     if on_leave:
         message = f"🏖️ *Team Leave Update*\nTeam members on leave today: {', '.join(on_leave)}"
@@ -88,9 +106,9 @@ def check_upcoming_leave():
         ).execute()
         
         for event in events.get('items', []):
-            if 'Annual Leave' in event.get('summary', ''):
+            if is_leave_event(event.get('summary', '')):
                 start_date = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date'))).date()
-                name = event['summary'].split(' - ')[0]
+                name = event['summary'].split(' - ')[0] if ' - ' in event['summary'] else calendar_id.split('@')[0]
                 upcoming_leave.append((start_date, name))
     
     if upcoming_leave:
@@ -114,6 +132,7 @@ def check_daily_meetings():
         start = datetime.combine(date, datetime.min.time()).isoformat() + 'Z'
         end = datetime.combine(date, datetime.max.time()).isoformat() + 'Z'
         
+        # Get regular calendar events
         events = service.events().list(
             calendarId=calendar_id,
             timeMin=start,
@@ -122,10 +141,25 @@ def check_daily_meetings():
             orderBy='startTime'
         ).execute()
         
+        # Get personal calendar events if configured
+        personal_calendar_id = os.getenv('PERSONAL_CALENDAR_ID')
+        if personal_calendar_id:
+            personal_events = service.events().list(
+                calendarId=personal_calendar_id,
+                timeMin=start,
+                timeMax=end,
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+            events['items'].extend(personal_events.get('items', []))
+            # Sort combined events by start time
+            events['items'].sort(key=lambda x: x['start'].get('dateTime', x['start'].get('date')))
+        
         meetings = []
         for event in events.get('items', []):
             start_time = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')))
-            meetings.append(f"• {start_time.strftime('%H:%M')} - {event.get('summary', 'No title')}")
+            calendar_name = "📆 Personal" if event.get('organizer', {}).get('email') == personal_calendar_id else "💼 Work"
+            meetings.append(f"• {start_time.strftime('%H:%M')} [{calendar_name}] - {event.get('summary', 'No title')}")
         
         day_str = "Today" if is_today else "Tomorrow"
         if meetings:
